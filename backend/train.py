@@ -1,18 +1,20 @@
 from pathlib import Path
 
-import joblib
+import numpy as np
 import pandas as pd
+import joblib
 
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.compose import TransformedTargetRegressor
 
 
 # ============================================================
-# Paths
+# PATHS
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -22,7 +24,42 @@ MODEL_PATH = PROJECT_ROOT / "model" / "car_price_model.pkl"
 
 
 # ============================================================
-# 1. Load data
+# CONFIG
+# ============================================================
+
+CURRENT_YEAR = 2026
+RANDOM_STATE = 42
+
+
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+def add_features(df):
+    """
+    Add useful derived features while keeping the original
+    API input fields unchanged.
+    """
+
+    df = df.copy()
+
+    # Age of the car
+    df["car_age"] = CURRENT_YEAR - df["year"]
+
+    # Extract brand from car name
+    df["brand"] = (
+        df["name"]
+        .astype(str)
+        .str.strip()
+        .str.split()
+        .str[0]
+    )
+
+    return df
+
+
+# ============================================================
+# LOAD DATA
 # ============================================================
 
 print("Loading dataset...")
@@ -30,13 +67,11 @@ print("Loading dataset...")
 df = pd.read_csv(DATA_PATH)
 
 print(f"Dataset shape: {df.shape}")
-
-print("\nColumns:")
-print(df.columns.tolist())
+print()
 
 
 # ============================================================
-# 2. Basic cleaning
+# SELECT REQUIRED COLUMNS
 # ============================================================
 
 required_columns = [
@@ -52,59 +87,55 @@ required_columns = [
 
 df = df[required_columns].copy()
 
-# Remove rows containing missing values
+
+# ============================================================
+# CLEAN DATA
+# ============================================================
+
 df = df.dropna()
 
-# Remove impossible / invalid values
-df = df[df["selling_price"] > 0]
-df = df[df["km_driven"] >= 0]
-df = df[df["year"] >= 1990]
-
-
-print(f"\nDataset after cleaning: {df.shape}")
-
-
-# ============================================================
-# 3. Features and target
-# ============================================================
-
-X = df[
-    [
-        "name",
-        "year",
-        "km_driven",
-        "fuel",
-        "seller_type",
-        "transmission",
-        "owner",
-    ]
+df = df[
+    (df["selling_price"] > 0)
+    & (df["km_driven"] >= 0)
+    & (df["year"] >= 1990)
+    & (df["year"] <= CURRENT_YEAR)
 ]
 
+print(f"Clean dataset shape: {df.shape}")
+print()
+
+
+# ============================================================
+# FEATURES / TARGET
+# ============================================================
+
+X = df.drop(columns=["selling_price"])
 y = df["selling_price"]
 
 
 # ============================================================
-# 4. Train/Test split
+# TRAIN / TEST SPLIT
 # ============================================================
 
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
-    test_size=0.2,
-    random_state=42,
+    test_size=0.20,
+    random_state=RANDOM_STATE,
 )
 
-
-print(f"\nTraining samples: {len(X_train)}")
-print(f"Testing samples:  {len(X_test)}")
+print(f"Training samples: {len(X_train)}")
+print(f"Testing samples : {len(X_test)}")
+print()
 
 
 # ============================================================
-# 5. Feature types
+# PREPROCESSING
 # ============================================================
 
 categorical_features = [
     "name",
+    "brand",
     "fuel",
     "seller_type",
     "transmission",
@@ -114,19 +145,16 @@ categorical_features = [
 numerical_features = [
     "year",
     "km_driven",
+    "car_age",
 ]
-
-
-# ============================================================
-# 6. Preprocessing
-# ============================================================
 
 preprocessor = ColumnTransformer(
     transformers=[
         (
             "categorical",
             OneHotEncoder(
-                handle_unknown="ignore"
+                handle_unknown="ignore",
+                min_frequency=2,
             ),
             categorical_features,
         ),
@@ -140,67 +168,165 @@ preprocessor = ColumnTransformer(
 
 
 # ============================================================
-# 7. ML model
+# MODELS
 # ============================================================
 
-model = RandomForestRegressor(
-    n_estimators=200,
-    random_state=42,
-    n_jobs=-1,
+models = {
+    "Random Forest": RandomForestRegressor(
+        n_estimators=300,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        max_features="sqrt",
+    ),
+
+    "Extra Trees": ExtraTreesRegressor(
+        n_estimators=300,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        max_features=1.0,
+    ),
+}
+
+
+# ============================================================
+# EXPERIMENTS
+# ============================================================
+
+results = []
+
+best_model = None
+best_model_name = None
+best_r2 = float("-inf")
+
+
+for model_name, regressor in models.items():
+
+    for target_type in ["normal", "log"]:
+
+        print("=" * 60)
+        print(f"Experiment: {model_name} + {target_type} target")
+        print("=" * 60)
+
+        # Feature engineering is inside the pipeline.
+        # Therefore API input remains unchanged.
+        base_pipeline = Pipeline(
+            steps=[
+                (
+                    "feature_engineering",
+                    FunctionTransformer(
+                        add_features,
+                        validate=False,
+                    ),
+                ),
+                (
+                    "preprocessor",
+                    preprocessor,
+                ),
+                (
+                    "model",
+                    regressor,
+                ),
+            ]
+        )
+
+        # Log-transform target for some experiments
+        if target_type == "log":
+
+            pipeline = TransformedTargetRegressor(
+                regressor=base_pipeline,
+                func=np.log1p,
+                inverse_func=np.expm1,
+            )
+
+        else:
+            pipeline = base_pipeline
+
+        # Train
+        pipeline.fit(X_train, y_train)
+
+        # Predict
+        predictions = pipeline.predict(X_test)
+
+        # Metrics
+        mae = mean_absolute_error(
+            y_test,
+            predictions,
+        )
+
+        r2 = r2_score(
+            y_test,
+            predictions,
+        )
+
+        print(f"MAE: ₹{mae:,.2f}")
+        print(f"R² : {r2:.4f}")
+        print()
+
+        results.append(
+            {
+                "model": model_name,
+                "target": target_type,
+                "MAE": mae,
+                "R2": r2,
+            }
+        )
+
+        # Keep best model
+        if r2 > best_r2:
+            best_r2 = r2
+            best_model = pipeline
+            best_model_name = f"{model_name} + {target_type}"
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+results_df = pd.DataFrame(results)
+
+results_df = results_df.sort_values(
+    by="R2",
+    ascending=False,
 )
 
+print()
+print("=" * 70)
+print("MODEL COMPARISON")
+print("=" * 70)
 
-# ============================================================
-# 8. Complete ML pipeline
-# ============================================================
-
-pipeline = Pipeline(
-    steps=[
-        ("preprocessor", preprocessor),
-        ("model", model),
-    ]
+print(
+    results_df.to_string(
+        index=False,
+        formatters={
+            "MAE": lambda x: f"₹{x:,.2f}",
+            "R2": lambda x: f"{x:.4f}",
+        },
+    )
 )
 
+print()
+print("=" * 70)
+print("BEST MODEL")
+print("=" * 70)
 
-# ============================================================
-# 9. Train
-# ============================================================
-
-print("\nTraining model...")
-
-pipeline.fit(X_train, y_train)
-
-
-# ============================================================
-# 10. Evaluation
-# ============================================================
-
-y_pred = pipeline.predict(X_test)
-
-mae = mean_absolute_error(y_test, y_pred)
-r2 = r2_score(y_test, y_pred)
-
-print("\n==============================")
-print("MODEL EVALUATION")
-print("==============================")
-
-print(f"MAE: ₹{mae:,.2f}")
-print(f"R²:  {r2:.4f}")
+print(f"Model: {best_model_name}")
+print(f"R²   : {best_r2:.4f}")
+print()
 
 
 # ============================================================
-# 11. Save complete pipeline
+# SAVE BEST MODEL
 # ============================================================
 
-MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+MODEL_PATH.parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 joblib.dump(
-    pipeline,
+    best_model,
     MODEL_PATH,
 )
 
-print("\n==============================")
-print("MODEL SAVED")
-print("==============================")
-
+print(f"Saved best model to:")
 print(MODEL_PATH)
